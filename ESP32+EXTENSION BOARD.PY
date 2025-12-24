@@ -1,0 +1,136 @@
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <ESP32Servo.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+// ===== Wi-Fi =====
+#define WIFI_SSID     "suci"
+#define WIFI_PASSWORD "suci0910"
+
+// ===== Firebase =====
+#define API_KEY      "AIzaSyDmQ802qZzSzFAx_HzQOwBACu1M-57Ya34"
+#define DATABASE_URL "https://smart-trash-app-2af97-default-rtdb.asia-southeast1.firebasedatabase.app/"
+#define DEV_ID "ESP32_1"
+ 
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ===== Ultrasonik =====
+#define TRIG_ORG 14
+#define ECHO_ORG 27
+#define TRIG_NON 26
+#define ECHO_NON 25
+
+// ===== Servo =====
+#define SERVO_ORGANIK 13
+#define SERVO_NONORGANIK 12
+Servo servoOrganik, servoNonOrganik;
+
+// ===== Variabel =====
+String hasilDeteksi = "";
+String jenisOrganik = "Belum terdeteksi";
+String jenisNonOrganik = "Belum terdeteksi";
+float jarakOrg = 0, jarakNon = 0;
+String statusOrg, statusNon, statusGlobal;
+
+// ===== Flag notifikasi agar tidak spam =====
+bool notifOrgTerkirim = false;
+bool notifNonTerkirim = false;
+
+// ===== Fungsi Jarak =====
+float getDistance(int trig, int echo) {
+  digitalWrite(trig, LOW); delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  long dur = pulseIn(echo, HIGH, 30000);
+  float cm = dur * 0.034 / 2;
+  if (cm <= 0 || cm > 200) cm = 200;
+  return cm;
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(TRIG_ORG, OUTPUT); pinMode(ECHO_ORG, INPUT);
+  pinMode(TRIG_NON, OUTPUT); pinMode(ECHO_NON, INPUT);
+
+  servoOrganik.attach(SERVO_ORGANIK);
+  servoNonOrganik.attach(SERVO_NONORGANIK);
+  servoOrganik.write(0);
+  servoNonOrganik.write(0);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("📶 Menghubungkan ke WiFi...");
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\n✅ Wi-Fi Terhubung!");
+
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  Firebase.signUp(&config, &auth, "", "");
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  Serial.println("🔥 Firebase siap!");
+}
+
+void loop() {
+  // ===== Ambil hasil deteksi dari ESP32-CAM =====
+  if (Firebase.RTDB.getString(&fbdo, "/deteksi/hasil")) {
+    hasilDeteksi = fbdo.stringData();
+    Serial.println("📩 Hasil deteksi: " + hasilDeteksi);
+  }
+
+  // ===== Ukur jarak =====
+  jarakOrg = getDistance(TRIG_ORG, ECHO_ORG);
+  jarakNon = getDistance(TRIG_NON, ECHO_NON);
+
+  // ===== Tentukan status =====
+  statusOrg = (jarakOrg < 4) ? "Penuh" : "Normal";
+  statusNon = (jarakNon < 4) ? "Penuh" : "Normal";
+  statusGlobal = (statusOrg == "Penuh" || statusNon == "Penuh") ? "Penuh" : "Normal";
+
+  // ===== Aksi berdasarkan hasil deteksi dari Firebase =====
+  if (hasilDeteksi == "Organik" && statusOrg == "Normal") {
+    servoOrganik.write(90); delay(2000); servoOrganik.write(0);
+    jenisOrganik = "Organik";
+    Firebase.RTDB.pushString(&fbdo, "/notifikasi", "🟢 Sampah organik terdeteksi & diterima");
+  } 
+  else if (hasilDeteksi == "Non-Organik" && statusNon == "Normal") {
+    servoNonOrganik.write(90); delay(2000); servoNonOrganik.write(0);
+    jenisNonOrganik = "Non-Organik";
+    Firebase.RTDB.pushString(&fbdo, "/notifikasi", "🔵 Sampah non-organik terdeteksi & diterima");
+  } 
+
+  // ===== Kirim data monitoring =====
+  FirebaseJson json;
+  json.set("jarakOrganik", jarakOrg); 
+  json.set("jarakNonOrganik", jarakNon);
+  json.set("jenisOrganik", jenisOrganik);
+  json.set("jenisNonOrganik", jenisNonOrganik);
+  json.set("statusOrganik", statusOrg);
+  json.set("statusNonOrganik", statusNon);
+  json.set("status", statusGlobal);
+
+  if (Firebase.RTDB.updateNode(&fbdo, ("/monitoring/" + String(DEV_ID)).c_str(), &json))
+    Serial.println("✅ Data terkirim ke Firebase");
+  else
+    Serial.printf("❌ Gagal update Firebase: %s\n", fbdo.errorReason().c_str());
+
+  // ===== Notifikasi PENUH (kirim sekali per perubahan status) =====
+  if (statusOrg == "Penuh" && !notifOrgTerkirim) {
+    Firebase.RTDB.pushString(&fbdo, "/notifikasi", "🚨 Tempat sampah organik penuh!");
+    notifOrgTerkirim = true;
+  } else if (statusOrg == "Normal" && notifOrgTerkirim) {
+    notifOrgTerkirim = false; // reset agar bisa kirim lagi nanti
+  }
+
+  if (statusNon == "Penuh" && !notifNonTerkirim) {
+    Firebase.RTDB.pushString(&fbdo, "/notifikasi", "🚨 Tempat sampah non-organik penuh!");
+    notifNonTerkirim = true;
+  } else if (statusNon == "Normal" && notifNonTerkirim) {
+    notifNonTerkirim = false;
+  }
+
+  // Delay antar loop
+  delay(3000);
+}
